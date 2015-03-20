@@ -15,15 +15,15 @@ module HTTParty
     SupportedURISchemes  = [URI::HTTP, URI::HTTPS, URI::Generic]
 
     NON_RAILS_QUERY_STRING_NORMALIZER = Proc.new do |query|
-      Array(query).map do |key, value|
+      Array(query).sort_by { |a| a[0].to_s }.map do |key, value|
         if value.nil?
           key.to_s
-        elsif value.is_a?(Array)
-          value.map {|v| "#{key}=#{URI.encode(v.to_s, Regexp.new("[^#{URI::PATTERN::UNRESERVED}]"))}"}
+        elsif value.respond_to?(:to_ary)
+          value.to_ary.map {|v| "#{key}=#{ERB::Util.url_encode(v.to_s)}"}
         else
           HashConversions.to_params(key => value)
         end
-      end.flatten.sort.join('&')
+      end.flatten.join('&')
     end
 
     attr_accessor :http_method, :options, :last_response, :redirect, :last_uri
@@ -33,16 +33,18 @@ module HTTParty
       self.http_method = http_method
       self.path = path
       self.options = {
-        :limit => o.delete(:no_follow) ? 1 : 5,
-        :default_params => {},
-        :follow_redirects => true,
-        :parser => Parser,
-        :connection_adapter => ConnectionAdapter
+        limit: o.delete(:no_follow) ? 1 : 5,
+        assume_utf16_is_big_endian: true,
+        default_params: {},
+        follow_redirects: true,
+        parser: Parser,
+        connection_adapter: ConnectionAdapter
       }.merge(o)
+      set_basic_auth_from_uri
     end
 
     def path=(uri)
-      @path = URI.parse(uri)
+      @path = URI(uri)
     end
 
     def request_uri(uri)
@@ -54,6 +56,13 @@ module HTTParty
     end
 
     def uri
+      if redirect && path.relative? && path.path[0] != "/"
+        last_uri_host = @last_uri.path.gsub(/[^\/]+$/, "")
+
+        path.path = "/#{path.path}" if last_uri_host[-1] != "/"
+        path.path = last_uri_host + path.path
+      end
+
       new_uri = path.relative? ? URI.parse("#{base_uri}#{path}") : path.clone
 
       # avoid double query string on redirects [#12]
@@ -94,7 +103,7 @@ module HTTParty
           chunks = []
 
           http_response.read_body do |fragment|
-            chunks << fragment
+            chunks << fragment unless options[:stream_body]
             block.call(fragment)
           end
 
@@ -102,8 +111,12 @@ module HTTParty
         end
       end
 
-      handle_deflation
+      handle_deflation unless http_method == Net::HTTP::Head
       handle_response(chunked_body, &block)
+    end
+
+    def raw_body
+      @raw_request.body
     end
 
     private
@@ -113,11 +126,11 @@ module HTTParty
     end
 
     def body
-      options[:body].is_a?(Hash) ? normalize_query(options[:body]) : options[:body]
+      options[:body].respond_to?(:to_hash) ? normalize_query(options[:body]) : options[:body]
     end
 
     def credentials
-      options[:basic_auth] || options[:digest_auth]
+      (options[:basic_auth] || options[:digest_auth]).to_hash
     end
 
     def username
@@ -143,14 +156,15 @@ module HTTParty
     def setup_raw_request
       @raw_request = http_method.new(request_uri(uri))
       @raw_request.body = body if body
-      @raw_request.initialize_http_header(options[:headers])
+      @raw_request.body_stream = options[:body_stream] if options[:body_stream]
+      @raw_request.initialize_http_header(options[:headers].to_hash) if options[:headers].respond_to?(:to_hash)
       @raw_request.basic_auth(username, password) if options[:basic_auth]
       setup_digest_auth if options[:digest_auth]
     end
 
     def setup_digest_auth
       auth_request = http_method.new(uri.request_uri)
-      auth_request.initialize_http_header(options[:headers])
+      auth_request.initialize_http_header(options[:headers].to_hash) if options[:headers].respond_to?(:to_hash)
       res = http.request(auth_request)
 
       if res['www-authenticate'] != nil && res['www-authenticate'].length > 0
@@ -162,27 +176,110 @@ module HTTParty
       query_string_parts = []
       query_string_parts << uri.query unless uri.query.nil?
 
-      if options[:query].is_a?(Hash)
-        query_string_parts << normalize_query(options[:default_params].merge(options[:query]))
+      if options[:query].respond_to?(:to_hash)
+        query_string_parts << normalize_query(options[:default_params].merge(options[:query].to_hash))
       else
         query_string_parts << normalize_query(options[:default_params]) unless options[:default_params].empty?
         query_string_parts << options[:query] unless options[:query].nil?
       end
 
+      query_string_parts.reject!(&:empty?) unless query_string_parts == [""]
       query_string_parts.size > 0 ? query_string_parts.join('&') : nil
+    end
+
+    def get_charset
+      content_type = last_response["content-type"]
+      if content_type.nil?
+        return nil
+      end
+
+      if content_type =~ /;\s*charset\s*=\s*([^=,;"\s]+)/i
+        return $1
+      end
+
+      if content_type =~ /;\s*charset\s*=\s*"((\\.|[^\\"])+)"/i
+        return $1.gsub(/\\(.)/, '\1')
+      end
+
+      nil
+    end
+
+    def encode_with_ruby_encoding(body, charset)
+      begin
+        encoding = Encoding.find(charset)
+        body.force_encoding(encoding)
+      rescue
+        body
+      end
+    end
+
+    def assume_utf16_is_big_endian
+      options[:assume_utf16_is_big_endian]
+    end
+
+    def encode_utf_16(body)
+      if body.bytesize >= 2
+        if body.getbyte(0) == 0xFF && body.getbyte(1) == 0xFE
+          return body.force_encoding("UTF-16LE")
+        elsif body.getbyte(0) == 0xFE && body.getbyte(1) == 0xFF
+          return body.force_encoding("UTF-16BE")
+        end
+      end
+
+      if assume_utf16_is_big_endian
+        body.force_encoding("UTF-16BE")
+      else
+        body.force_encoding("UTF-16LE")
+      end
+
+    end
+
+    def _encode_body(body)
+      charset = get_charset
+
+      if charset.nil?
+        return body
+      end
+
+      if "utf-16".casecmp(charset) == 0
+        encode_utf_16(body)
+      else
+        encode_with_ruby_encoding(body, charset)
+      end
+    end
+
+    def encode_body(body)
+      if "".respond_to?(:encoding)
+        _encode_body(body)
+      else
+        body
+      end
     end
 
     def handle_response(body, &block)
       if response_redirects?
         options[:limit] -= 1
+        if options[:logger]
+          logger = HTTParty::Logger.build(options[:logger], options[:log_level], options[:log_format])
+          logger.format(self, last_response)
+        end
         self.path = last_response['location']
         self.redirect = true
-        self.http_method = Net::HTTP::Get unless options[:maintain_method_across_redirects]
+        if last_response.class == Net::HTTPSeeOther
+          unless options[:maintain_method_across_redirects] and options[:resend_on_redirect]
+            self.http_method = Net::HTTP::Get
+          end
+        else
+          unless options[:maintain_method_across_redirects]
+            self.http_method = Net::HTTP::Get
+          end
+        end
         capture_cookies(last_response)
         perform(&block)
       else
         body = body || last_response.body
-        Response.new(self, last_response, lambda { parse_response(body) }, :body => body)
+        body = encode_body(body)
+        Response.new(self, last_response, lambda { parse_response(body) }, body: body)
       end
     end
 
@@ -218,8 +315,8 @@ module HTTParty
     def capture_cookies(response)
       return unless response['Set-Cookie']
       cookies_hash = HTTParty::CookieHash.new()
-      cookies_hash.add_cookies(options[:headers]['Cookie']) if options[:headers] && options[:headers]['Cookie']
-      cookies_hash.add_cookies(response['Set-Cookie'])
+      cookies_hash.add_cookies(options[:headers].to_hash['Cookie']) if options[:headers] && options[:headers].to_hash['Cookie']
+      response.get_fields('Set-Cookie').each { |cookie| cookies_hash.add_cookies(cookie) }
       options[:headers] ||= {}
       options[:headers]['Cookie'] = cookies_hash.to_cookie_string
     end
@@ -236,15 +333,22 @@ module HTTParty
     def validate
       raise HTTParty::RedirectionTooDeep.new(last_response), 'HTTP redirects too deep' if options[:limit].to_i <= 0
       raise ArgumentError, 'only get, post, patch, put, delete, head, and options methods are supported' unless SupportedHTTPMethods.include?(http_method)
-      raise ArgumentError, ':headers must be a hash' if options[:headers] && !options[:headers].is_a?(Hash)
+      raise ArgumentError, ':headers must be a hash' if options[:headers] && !options[:headers].respond_to?(:to_hash)
       raise ArgumentError, 'only one authentication method, :basic_auth or :digest_auth may be used at a time' if options[:basic_auth] && options[:digest_auth]
-      raise ArgumentError, ':basic_auth must be a hash' if options[:basic_auth] && !options[:basic_auth].is_a?(Hash)
-      raise ArgumentError, ':digest_auth must be a hash' if options[:digest_auth] && !options[:digest_auth].is_a?(Hash)
-      raise ArgumentError, ':query must be hash if using HTTP Post' if post? && !options[:query].nil? && !options[:query].is_a?(Hash)
+      raise ArgumentError, ':basic_auth must be a hash' if options[:basic_auth] && !options[:basic_auth].respond_to?(:to_hash)
+      raise ArgumentError, ':digest_auth must be a hash' if options[:digest_auth] && !options[:digest_auth].respond_to?(:to_hash)
+      raise ArgumentError, ':query must be hash if using HTTP Post' if post? && !options[:query].nil? && !options[:query].respond_to?(:to_hash)
     end
 
     def post?
       Net::HTTP::Post == http_method
+    end
+
+    def set_basic_auth_from_uri
+      if path.userinfo
+        username, password = path.userinfo.split(':')
+        options[:basic_auth] = {:username => username, :password => password}
+      end
     end
   end
 end
