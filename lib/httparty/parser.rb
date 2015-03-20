@@ -112,9 +112,9 @@ module HTTParty
     def json
       # https://github.com/sferik/rails/commit/5e62670131dfa1718eaf21ff8dd3371395a5f1cc
       if MultiJson.respond_to?(:adapter)
-        MultiJson.load(body)
+        MultiJson.load(body.encode("UTF-8"))
       else
-        MultiJson.decode(body)
+        MultiJson.decode(body.encode("UTF-8"))
       end
     end
 
